@@ -1,0 +1,472 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: THANDANAZI Workforce production backend
+Parameters:
+  AllowedOrigin:
+    Type: String
+    Default: http://localhost:5173
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 30
+    MemorySize: 256
+    Architectures: [arm64]
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref WorkforceTable
+        UPLOAD_BUCKET: !Ref UploadsBucket
+        SNS_TOPIC_ARN: !Ref EmergencyTopic
+        WEBSOCKET_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+        USER_POOL_ID: !Ref UserPool
+        USER_POOL_CLIENT_ID: !Ref UserPoolClient
+        CORS_ORIGIN: '*' # Lambda responses use wildcard because JWT auth protects API and local/CloudFront both need browser access
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: thandanazi-workforce-users
+      UsernameConfiguration: { CaseSensitive: false }
+      AutoVerifiedAttributes: [email]
+      Schema:
+        - { Name: employeeNumber, AttributeDataType: String, Mutable: false, Required: false }
+        - { Name: role, AttributeDataType: String, Mutable: true, Required: false }
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 7
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: thandanazi-workforce-web
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits: { AccessToken: hours, IdToken: hours, RefreshToken: days }
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH, ALLOW_ADMIN_USER_PASSWORD_AUTH]
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            IdentitySource: '$request.header.Authorization'
+            JwtConfiguration:
+              audience: [!Ref UserPoolClient]
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+        DefaultAuthorizer: CognitoAuthorizer
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: [GET, POST, PATCH, DELETE, OPTIONS]
+        AllowHeaders: [authorization, content-type, x-thandanazi-request-id]
+
+  WorkforceTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+        - { AttributeName: GSI_WorkerDatePK, AttributeType: S }
+        - { AttributeName: GSI_WorkerDateSK, AttributeType: S }
+        - { AttributeName: GSI_SiteDatePK, AttributeType: S }
+        - { AttributeName: GSI_SiteDateSK, AttributeType: S }
+        - { AttributeName: GSI_PayrollPK, AttributeType: S }
+        - { AttributeName: GSI_PayrollSK, AttributeType: S }
+        - { AttributeName: GSI_StatusPK, AttributeType: S }
+        - { AttributeName: GSI_StatusSK, AttributeType: S }
+        - { AttributeName: GSI5PK, AttributeType: S }
+        - { AttributeName: GSI5SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+      GlobalSecondaryIndexes:
+        - IndexName: GSI_WorkerDate
+          KeySchema: [{ AttributeName: GSI_WorkerDatePK, KeyType: HASH }, { AttributeName: GSI_WorkerDateSK, KeyType: RANGE }]
+          Projection: { ProjectionType: ALL }
+        - IndexName: GSI_SiteDate
+          KeySchema: [{ AttributeName: GSI_SiteDatePK, KeyType: HASH }, { AttributeName: GSI_SiteDateSK, KeyType: RANGE }]
+          Projection: { ProjectionType: ALL }
+        - IndexName: GSI_Payroll
+          KeySchema: [{ AttributeName: GSI_PayrollPK, KeyType: HASH }, { AttributeName: GSI_PayrollSK, KeyType: RANGE }]
+          Projection: { ProjectionType: ALL }
+        - IndexName: GSI_Status
+          KeySchema: [{ AttributeName: GSI_StatusPK, KeyType: HASH }, { AttributeName: GSI_StatusSK, KeyType: RANGE }]
+          Projection: { ProjectionType: ALL }
+        - IndexName: GSI_ConnectionsByRole
+          KeySchema: [{ AttributeName: GSI5PK, KeyType: HASH }, { AttributeName: GSI5SK, KeyType: RANGE }]
+          Projection: { ProjectionType: ALL }
+
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-frontend-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: FrontendS3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig: {}
+            OriginAccessControlId: !Ref FrontendOriginAccessControl
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+            Cookies: { Forward: none }
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}'
+
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: ['*']
+            AllowedMethods: [PUT, GET]
+            AllowedHeaders: ['*']
+            ExposedHeaders: [ETag]
+            MaxAge: 300
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionOldPhotos
+            Status: Enabled
+            Transitions: [{ StorageClass: STANDARD_IA, TransitionInDays: 90 }]
+  EmergencyTopic:
+    Type: AWS::SNS::Topic
+    Properties: { TopicName: thandanazi-emergency-alerts }
+
+  ShiftFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend
+      Handler: dist/functions/shift/index.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref WorkforceTable }
+        - Statement:
+            - Effect: Allow
+              Action: execute-api:ManageConnections
+              Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/prod/POST/@connections/*'
+      Events:
+        ClockIn: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/shifts/clock-in', Method: POST } }
+        ClockOut: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/shifts/clock-out', Method: POST } }
+        Active: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/shifts/active', Method: GET } }
+        ChecklistReport: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/checklists/report', Method: POST } }
+  OpsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend
+      Handler: dist/functions/ops/index.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref WorkforceTable }
+        - SNSPublishMessagePolicy: { TopicName: !GetAtt EmergencyTopic.TopicName }
+        - Statement:
+            - Effect: Allow
+              Action: execute-api:ManageConnections
+              Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/prod/POST/@connections/*'
+      Events:
+        Fuel: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/ops/fuel', Method: POST } }
+        Breakdown: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/ops/breakdown', Method: POST } }
+        Emergency: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/ops/emergency', Method: POST } }
+  UploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend
+      Handler: dist/functions/uploads/index.handler
+      Policies: [ { S3WritePolicy: { BucketName: !Ref UploadsBucket } } ]
+      Events:
+        Upload: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/uploads/presign', Method: POST } }
+  CatalogFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend
+      Handler: dist/functions/catalog/index.handler
+      Policies: [ { DynamoDBReadPolicy: { TableName: !Ref WorkforceTable } } ]
+      Events:
+        Me: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/me', Method: GET } }
+        Sites: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/sites', Method: GET } }
+        Machines: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/sites/{siteId}/machines', Method: GET } }
+  TasksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend
+      Handler: dist/functions/tasks/index.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref WorkforceTable }
+        - Statement:
+            - Effect: Allow
+              Action: execute-api:ManageConnections
+              Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/prod/POST/@connections/*'
+      Events:
+        ListTasks: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/tasks', Method: GET } }
+        ReadTask: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/tasks/{taskId}/read', Method: PATCH } }
+        CompleteTask: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/tasks/{taskId}/complete', Method: PATCH } }
+        FuelStockForWorker: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/tasks/fuel-stock', Method: GET } }
+        CompleteFuelTask: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/tasks/{taskId}/fuel-complete', Method: POST } }
+        CreateTask: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/supervisor/tasks', Method: POST } }
+  SupervisorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend
+      Handler: dist/functions/supervisor/index.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref WorkforceTable }
+        - Statement:
+            - Effect: Allow
+              Action: execute-api:ManageConnections
+              Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/prod/POST/@connections/*'
+      Events:
+        Overview: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/supervisor/overview', Method: GET } }
+        TaskTargets: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/supervisor/task-targets', Method: GET } }
+        ActiveShifts: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/supervisor/active-shifts', Method: GET } }
+        OpsList: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/supervisor/ops', Method: GET } }
+        OpsStatus: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/supervisor/ops/{id}/status', Method: PATCH } }
+        AssignFuel: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/supervisor/fuel/{id}/assign', Method: POST } }
+        FuelStock: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/supervisor/fuel-stock', Method: GET } }
+        FuelStockReceive: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/supervisor/fuel-stock/receive', Method: POST } }
+  AdminFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend
+      Handler: dist/functions/admin/index.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref WorkforceTable }
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminSetUserPassword
+                - cognito-idp:AdminUpdateUserAttributes
+                - cognito-idp:AdminDisableUser
+                - cognito-idp:AdminEnableUser
+              Resource: !GetAtt UserPool.Arn
+      Events:
+        ListEmployees: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/employees', Method: GET } }
+        CreateEmployee: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/employees', Method: POST } }
+        UpdateEmployee: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/employees/{employeeNumber}', Method: PATCH } }
+        ArchiveEmployee: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/employees/{employeeNumber}', Method: DELETE } }
+        ResetEmployeePassword: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/employees/{employeeNumber}/reset-password', Method: POST } }
+        UpdateCertificates: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/employees/{employeeNumber}/certificates', Method: PATCH } }
+        ListMachines: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/machines', Method: GET } }
+        CreateMachine: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/machines', Method: POST } }
+        UpdateMachine: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/machines/{machineId}', Method: PATCH } }
+        ArchiveMachine: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/machines/{machineId}', Method: DELETE } }
+        ListSites: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/sites', Method: GET } }
+        CreateSite: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/sites', Method: POST } }
+        UpdateSite: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/sites/{siteId}', Method: PATCH } }
+        ArchiveSite: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/sites/{siteId}', Method: DELETE } }
+        ListChecklists: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/checklists', Method: GET } }
+        SaveChecklist: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/checklists', Method: POST } }
+        DeleteChecklist: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/checklists/{templateId}', Method: DELETE } }
+        ListEmergencyContacts: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/emergency-contacts', Method: GET } }
+        SaveEmergencyContact: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/emergency-contacts', Method: POST } }
+        DeleteEmergencyContact: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/emergency-contacts/{contactId}', Method: DELETE } }
+        ListAudit: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/admin/audit', Method: GET } }
+  PayrollFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend
+      Handler: dist/functions/payroll/index.handler
+      MemorySize: 512
+      Timeout: 60
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref WorkforceTable }
+        - S3CrudPolicy: { BucketName: !Ref UploadsBucket }
+      Events:
+        Filters: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/supervisor/payroll/filters', Method: GET } }
+        Export: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/supervisor/payroll/export', Method: POST } }
+  SyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend
+      Handler: dist/functions/sync/index.handler
+      Policies: [ { DynamoDBCrudPolicy: { TableName: !Ref WorkforceTable } } ]
+      Events:
+        Sync: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/sync', Method: POST } }
+
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: thandanazi-workforce-ws
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: '$request.body.action'
+  WebSocketAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend
+      Handler: dist/functions/websocket/authorizer.handler
+  WebSocketAuthorizerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WebSocketAuthorizerFunction
+      Principal: apigateway.amazonaws.com
+  WebSocketAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref WebSocketApi
+      Name: CognitoQueryTokenAuthorizer
+      AuthorizerType: REQUEST
+      IdentitySource: [route.request.querystring.token]
+      AuthorizerUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketAuthorizerFunction.Arn}/invocations'
+  WebSocketConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend
+      Handler: dist/functions/websocket/connect.handler
+      Policies: [ { DynamoDBCrudPolicy: { TableName: !Ref WorkforceTable } } ]
+  WebSocketDisconnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend
+      Handler: dist/functions/websocket/disconnect.handler
+      Policies: [ { DynamoDBCrudPolicy: { TableName: !Ref WorkforceTable } } ]
+  WebSocketMessageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend
+      Handler: dist/functions/websocket/message.handler
+      Policies: [ { DynamoDBCrudPolicy: { TableName: !Ref WorkforceTable } } ]
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketConnectFunction.Arn}/invocations'
+  DisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketDisconnectFunction.Arn}/invocations'
+  DefaultIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketMessageFunction.Arn}/invocations'
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref WebSocketAuthorizer
+      Target: !Join ['/', ['integrations', !Ref ConnectIntegration]]
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      Target: !Join ['/', ['integrations', !Ref DisconnectIntegration]]
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      Target: !Join ['/', ['integrations', !Ref DefaultIntegration]]
+  ConnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties: { Action: lambda:InvokeFunction, FunctionName: !Ref WebSocketConnectFunction, Principal: apigateway.amazonaws.com }
+  DisconnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties: { Action: lambda:InvokeFunction, FunctionName: !Ref WebSocketDisconnectFunction, Principal: apigateway.amazonaws.com }
+  DefaultPermission:
+    Type: AWS::Lambda::Permission
+    Properties: { Action: lambda:InvokeFunction, FunctionName: !Ref WebSocketMessageFunction, Principal: apigateway.amazonaws.com }
+  WebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn: [ConnectRoute, DisconnectRoute, DefaultRoute]
+    Properties: { ApiId: !Ref WebSocketApi }
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      StageName: prod
+      DeploymentId: !Ref WebSocketDeployment
+      DefaultRouteSettings: { ThrottlingBurstLimit: 100, ThrottlingRateLimit: 50 }
+Outputs:
+  ApiUrl: { Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com' }
+  WebSocketUrl: { Value: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod' }
+  UserPoolId: { Value: !Ref UserPool }
+  UserPoolClientId: { Value: !Ref UserPoolClient }
+  WorkforceTableName: { Value: !Ref WorkforceTable }
+  UploadBucket: { Value: !Ref UploadsBucket }
+  FrontendBucket: { Value: !Ref FrontendBucket }
+  CloudFrontUrl: { Value: !Sub 'https://${FrontendDistribution.DomainName}' }
+  CloudFrontDistributionId: { Value: !Ref FrontendDistribution }
+  EmergencyTopicArn: { Value: !Ref EmergencyTopic }

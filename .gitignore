@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+backend/node_modules/
+
+# Environment files / secrets
+.env
+.env.*
+!.env.example
+frontend/.env
+backend/.env
+
+# Build output
+dist/
+build/
+.aws-sam/
+
+# AWS / credentials
+.aws/
+*.pem
+*.key
+credentials
+
+# User / production data
+/data/
+uploads/
+photos/
+
+# Logs
+*.log
+npm-debug.log*
+
+# macOS
+.DS_Store
+
+# Backups
+*.bak
+*.backup
+*.tmp
+
+# Compiled backend output
+backend/dist/

@@ -1,0 +1,33 @@
+{
+  "name": "thandanazi-workforce-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "seed": "node dist/scripts/seed.js",
+    "reset:workers:preview": "node ../scripts/reset-all-worker-passwords.mjs",
+    "reset:workers": "node ../scripts/reset-all-worker-passwords.mjs --apply",
+    "reset:workers:self-test": "node ../scripts/reset-all-worker-passwords.mjs --self-test",
+    "fuel:cleanup:preview": "node dist/scripts/cleanupFuelTasks.js",
+    "fuel:cleanup": "node dist/scripts/cleanupFuelTasks.js --apply",
+    "fuel:cleanup:self-test": "node dist/scripts/cleanupFuelTasks.js --self-test"
+  },
+  "dependencies": {
+    "@aws-sdk/client-apigatewaymanagementapi": "^3.750.0",
+    "@aws-sdk/client-cognito-identity-provider": "^3.750.0",
+    "@aws-sdk/client-dynamodb": "^3.750.0",
+    "@aws-sdk/client-s3": "^3.750.0",
+    "@aws-sdk/client-sns": "^3.750.0",
+    "@aws-sdk/lib-dynamodb": "^3.750.0",
+    "@aws-sdk/s3-request-presigner": "^3.750.0",
+    "aws-jwt-verify": "^5.0.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.147",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
